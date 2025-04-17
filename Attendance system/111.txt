@@ -1,0 +1,274 @@
+import dlib
+import numpy as np
+import cv2
+import os
+import pandas as pd
+import time
+import logging
+import sqlite3
+import datetime
+import tkinter as tk
+from tkinter import font as tkFont
+from PIL import Image, ImageTk
+
+# Dlib frontal face detector
+detector = dlib.get_frontal_face_detector()
+
+# Dlib landmark predictor
+predictor = dlib.shape_predictor('data/data_dlib/shape_predictor_68_face_landmarks.dat')
+
+# Dlib Resnet model for face recognition
+face_reco_model = dlib.face_recognition_model_v1("data/data_dlib/dlib_face_recognition_resnet_model_v1.dat")
+
+# Create a connection to the database
+conn = sqlite3.connect("attendance.db")
+cursor = conn.cursor()
+
+# Create a table for the current date
+current_date = datetime.datetime.now().strftime("%Y_%m_%d")  # Replace hyphens with underscores
+table_name = "attendance"
+create_table_sql = f"CREATE TABLE IF NOT EXISTS {table_name} (name TEXT, time TEXT, date DATE, UNIQUE(name, date))"
+cursor.execute(create_table_sql)
+
+# Commit changes and close the connection
+conn.commit()
+conn.close()
+
+
+class Face_Recognizer:
+    def __init__(self):
+        self.font = cv2.FONT_ITALIC
+
+        # FPS
+        self.frame_time = 0
+        self.frame_start_time = 0
+        self.fps = 0
+        self.fps_show = 0
+        self.start_time = time.time()
+
+        # cnt for frame
+        self.frame_cnt = 0
+
+        # Save the features of faces in the database
+        self.face_features_known_list = []
+        # Save the name of faces in the database
+        self.face_name_known_list = []
+
+        # List to save centroid positions of ROI in frame N-1 and N
+        self.last_frame_face_centroid_list = []
+        self.current_frame_face_centroid_list = []
+
+        # List to save names of objects in frame N-1 and N
+        self.last_frame_face_name_list = []
+        self.current_frame_face_name_list = []
+
+        # cnt for faces in frame N-1 and N
+        self.last_frame_face_cnt = 0
+        self.current_frame_face_cnt = 0
+
+        # Save the e-distance for faceX when recognizing
+        self.current_frame_face_X_e_distance_list = []
+
+        # Save the positions and names of current faces captured
+        self.current_frame_face_position_list = []
+        # Save the features of people in current frame
+        self.current_frame_face_feature_list = []
+
+        # e distance between centroid of ROI in last and current frame
+        self.last_current_frame_centroid_e_distance = 0
+
+        # Reclassify after 'reclassify_interval' frames
+        self.reclassify_interval_cnt = 0
+        self.reclassify_interval = 10
+
+        # Tkinter GUI
+        self.win = tk.Tk()
+        self.win.title("Face Recognition System")
+        self.win.geometry("1000x600")
+
+        # Camera Display Frame
+        self.frame_left_camera = tk.Frame(self.win)
+        self.label = tk.Label(self.frame_left_camera)
+        self.label.pack()
+        self.frame_left_camera.pack(side=tk.LEFT)
+
+        # Right Panel - Info and Controls
+        self.frame_right_info = tk.Frame(self.win)
+        self.label_fps_info = tk.Label(self.frame_right_info, text="FPS: ")
+        self.label_face_cnt = tk.Label(self.frame_right_info, text="Faces in Frame: 0")
+        self.label_warning = tk.Label(self.frame_right_info, text="", fg="red")
+        self.log_all = tk.Label(self.frame_right_info, text="")
+
+        self.font_title = tkFont.Font(family='Helvetica', size=20, weight='bold')
+        self.font_step_title = tkFont.Font(family='Helvetica', size=15, weight='bold')
+
+        # Organizing UI Layout
+        tk.Label(self.frame_right_info, text="Face Recognition System", font=self.font_title).grid(row=0, column=0, columnspan=3, pady=10)
+
+        tk.Label(self.frame_right_info, text="FPS: ").grid(row=1, column=0, padx=5, pady=2, sticky="w")
+        self.label_fps_info.grid(row=1, column=1, padx=5, pady=2, sticky="w")
+
+        tk.Label(self.frame_right_info, text="Faces in Frame: ").grid(row=2, column=0, padx=5, pady=2, sticky="w")
+        self.label_face_cnt.grid(row=2, column=1, padx=5, pady=2, sticky="w")
+
+        self.label_warning.grid(row=3, column=0, columnspan=2, pady=5)
+
+        self.log_all.grid(row=4, column=0, columnspan=2, pady=10)
+
+        self.frame_right_info.pack(side=tk.RIGHT, padx=10)
+
+        # Try to find a working camera
+        self.cap = self.get_camera_source()
+        if not self.cap or not self.cap.isOpened():
+            print("❌ Error: No valid camera source found.")
+            exit()
+
+    def get_camera_source(self):
+        print("🔍 Checking available camera sources...")
+
+        cap = cv2.VideoCapture(0, cv2.CAP_V4L2)  # Force V4L2
+        if cap.isOpened():
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            print("✅ Using OpenCV VideoCapture(0) with 640x480 resolution")
+            return cap
+
+        cap = cv2.VideoCapture("/dev/video0")
+        if cap.isOpened():
+            print("✅ Using /dev/video0 (V4L2)")
+            return cap
+
+        print("❌ No working camera detected.")
+        return None
+
+    def get_frame(self):
+        if not self.cap or not self.cap.isOpened():
+            print("❌ Error: Camera is not opened! Retrying...")
+            self.cap.release()
+            time.sleep(2)
+            self.cap = self.get_camera_source()
+            return None, None  
+
+        ret, frame = self.cap.read()
+
+        if not ret or frame is None or frame.size == 0:
+            print("❌ Warning: No frame captured. Retrying...")
+            return None, None  
+
+        print(f"✅ Frame captured! Shape: {frame.shape}")
+
+        if frame.shape[0] == 1 and frame.shape[1] > 1000:
+            print("❌ Error: Frame is not correctly shaped. Reshaping...")
+            frame = frame.reshape((480, 640, 3))
+
+        return ret, cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    def get_face_database(self):
+        if os.path.exists("data/features_all.csv"):
+            path_features_known_csv = "data/features_all.csv"
+            csv_rd = pd.read_csv(path_features_known_csv, header=None)
+            for i in range(csv_rd.shape[0]):
+                features_someone_arr = []
+                self.face_name_known_list.append(csv_rd.iloc[i][0])
+                for j in range(1, 129):
+                    if csv_rd.iloc[i][j] == '':
+                        features_someone_arr.append('0')
+                    else:
+                        features_someone_arr.append(csv_rd.iloc[i][j])
+                self.face_features_known_list.append(features_someone_arr)
+            logging.info("Faces in Database： %d", len(self.face_features_known_list))
+            return 1
+        else:
+            logging.warning("'features_all.csv' not found!")
+            logging.warning("Please run 'get_faces_from_camera.py' "
+                            "and 'features_extraction_to_csv.py' before 'face_reco_from_camera.py'")
+            return 0
+
+    def update_fps(self):
+        now = time.time()
+        self.fps_show = 1.0 / (now - self.start_time)
+        self.start_time = now
+        self.label_fps_info["text"] = f"FPS: {self.fps_show:.2f}"
+
+    @staticmethod
+    def return_euclidean_distance(feature_1, feature_2):
+        feature_1 = np.array(feature_1)
+        feature_2 = np.array(feature_2)
+        dist = np.sqrt(np.sum(np.square(feature_1 - feature_2)))
+        return dist
+
+    def centroid_tracker(self):
+        for i in range(len(self.current_frame_face_centroid_list)):
+            e_distance_current_frame_person_x_list = []
+            for j in range(len(self.last_frame_face_centroid_list)):
+                self.last_current_frame_centroid_e_distance = self.return_euclidean_distance(
+                    self.current_frame_face_centroid_list[i], self.last_frame_face_centroid_list[j])
+                e_distance_current_frame_person_x_list.append(self.last_current_frame_centroid_e_distance)
+
+            last_frame_num = e_distance_current_frame_person_x_list.index(min(e_distance_current_frame_person_x_list))
+            self.current_frame_face_name_list[i] = self.last_frame_face_name_list[last_frame_num]
+
+    def attendance(self, name):
+        current_date = datetime.datetime.now().strftime('%Y-%m-%d')
+        conn = sqlite3.connect("attendance.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM attendance WHERE name = ? AND date = ?", (name, current_date))
+        existing_entry = cursor.fetchone()
+
+        if existing_entry:
+            print(f"{name} is already marked as present for {current_date}")
+        else:
+            current_time = datetime.datetime.now().strftime('%H:%M:%S')
+            cursor.execute("INSERT INTO attendance (name, time, date) VALUES (?, ?, ?)", (name, current_time, current_date))
+            conn.commit()
+            print(f"{name} marked as present for {current_date} at {current_time}")
+
+        conn.close()
+
+    def process(self):
+        ret, self.current_frame = self.get_frame()
+        if self.current_frame is None:
+            self.win.after(20, self.process)
+            return
+
+        faces = detector(self.current_frame, 0)
+
+        # Update the number of faces in the current frame
+        self.current_frame_faces_cnt = len(faces)
+        self.label_face_cnt["text"] = f"Faces in Frame: {self.current_frame_faces_cnt}"
+
+        # Draw rectangle around faces and update ROI coordinates
+        for d in faces:
+            x1, y1, x2, y2 = d.left(), d.top(), d.right(), d.bottom()
+            self.current_frame = cv2.rectangle(self.current_frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+
+            # Update face ROI coordinates
+            self.face_ROI_height_start = y1
+            self.face_ROI_height = y2 - y1
+            self.face_ROI_width_start = x1
+            self.face_ROI_width = x2 - x1
+
+        try:
+            img_Image = Image.fromarray(self.current_frame)
+            img_PhotoImage = ImageTk.PhotoImage(image=img_Image)
+            self.label.img_tk = img_PhotoImage
+            self.label.configure(image=img_PhotoImage)
+        except Exception as e:
+            print("❌ Error converting frame to Tkinter format:", e)
+
+        self.win.after(20, self.process)
+
+    def run(self):
+        if self.get_face_database():
+            self.process()
+            self.win.mainloop()
+
+
+def main():
+    logging.basicConfig(level=logging.INFO)
+    Face_Recognizer_con = Face_Recognizer()
+    Face_Recognizer_con.run()
+
+
+if __name__ == '__main__':
+    main()
